@@ -119,11 +119,12 @@ jobs:
       - name: Release version
         id: release_version
         run: |
-          app_version=$(sed -ne "s/^APP_VERSION\s*=\s*'([^']*)'/\1/p" version.py)
-          frontend_version=$(sed -ne "s/^FRONTEND_VERSION\s*=\s*'([^']*)'/\1/p" version.py)
+          app_version=$(sed -nE "s/^APP_VERSION\s*=\s*'([^']*)'/\1/p" version.py)
+          frontend_version=$(sed -nE "s/^FRONTEND_VERSION\s*=\s*'([^']*)'/\1/p" version.py)
           echo "app_version=${app_version}" >> $GITHUB_ENV
           echo "SOURCE_COMMIT=$(git rev-parse HEAD)" >> $GITHUB_ENV
           echo "frontend_version=${frontend_version}" >> "$GITHUB_OUTPUT"
+
 
       - name: Resolve External Payload Revisions
         id: payloads
