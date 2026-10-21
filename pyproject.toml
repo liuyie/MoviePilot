@@ -101,6 +101,8 @@ dependencies = [
     "watchfiles~=1.2.0",
     "webauthn~=2.8.0",
     "websocket-client~=1.9.0",
+    "aiohttp>=3.14.4",
+    "certifi>=2026.10.19",
 ]
 
 [dependency-groups]
