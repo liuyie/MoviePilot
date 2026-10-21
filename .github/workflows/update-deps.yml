@@ -28,8 +28,10 @@ jobs:
           ref: v3
           fetch-depth: 0
 
-      - name: Setup uv
+      - name: Setup uv, lock Python 3.14
         uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.14"
 
       - name: Update aiohttp & certifi only
         run: |
