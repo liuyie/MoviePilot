@@ -1,19 +1,15 @@
-name: Manual Update Python Dependencies
+name: Manual Update Python Dependencies (aiohttp + certifi only)
 on:
   workflow_dispatch:
     inputs:
       aiohttp_version:
-        description: aiohttp 版本，留空自动更新到最新
+        description: aiohttp 版本（建议填 3.14.4）
         required: false
-        default: ""
+        default: "3.14.4"
       certifi_version:
-        description: certifi 版本，留空自动更新到最新
+        description: certifi 版本（建议填 2026.10.19）
         required: false
-        default: ""
-      pillow_version:
-        description: pillow 版本，留空自动更新到最新
-        required: false
-        default: ""
+        default: "2026.10.19"
 permissions:
   contents: write
 
@@ -21,6 +17,11 @@ jobs:
   update:
     runs-on: ubuntu-latest
     steps:
+      - name: Install system deps for pillow-avif-plugin
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libavif-dev
+
       - name: Checkout code
         uses: actions/checkout@v7
         with:
@@ -30,30 +31,9 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v10.0.1
 
-      - name: Build uv add arguments
-        id: build_args
+      - name: Update aiohttp & certifi only
         run: |
-          args=()
-          if [[ -n "${{ github.event.inputs.aiohttp_version }}" ]]; then
-            args+=("aiohttp>=${{ github.event.inputs.aiohttp_version }}")
-          else
-            args+=("aiohttp")
-          fi
-          if [[ -n "${{ github.event.inputs.certifi_version }}" ]]; then
-            args+=("certifi>=${{ github.event.inputs.certifi_version }}")
-          else
-            args+=("certifi")
-          fi
-          if [[ -n "${{ github.event.inputs.pillow_version }}" ]]; then
-            args+=("pillow>=${{ github.event.inputs.pillow_version }}")
-          else
-            args+=("pillow")
-          fi
-          echo "DEPS=${args[*]}" >> $GITHUB_OUTPUT
-
-      - name: Update dependencies & regenerate lock
-        run: |
-          uv add ${{ steps.build_args.outputs.DEPS }}
+          uv add "aiohttp>=${{ github.event.inputs.aiohttp_version }}" "certifi>=${{ github.event.inputs.certifi_version }}"
           uv lock --check
 
       - name: Show diff
@@ -67,6 +47,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "✅ 没有依赖变更，无需提交"
           else
-            git commit -m "chore(deps): bump aiohttp certifi pillow via manual workflow"
+            git commit -m "chore(deps): bump aiohttp=${{ github.event.inputs.aiohttp_version }} certifi=${{ github.event.inputs.certifi_version }}"
             git push origin v3
           fi
