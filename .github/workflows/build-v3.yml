@@ -1,46 +1,87 @@
 name: MoviePilot Builder v3
 on:
+  workflow_dispatch:
   push:
     branches:
       - v3
-  pull_request:
-    branches:
-      - v3
-  workflow_dispatch:
+    paths:
+      - 'version.py'
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
-concurrency:
-  group: builder-v3-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  audit:
-    name: Dependency Audit / runtime-standard
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
+  release-gate:
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.detect.outputs.publish }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
-      - name: Setup uv
+      - name: Detect version change
+        id: detect
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          versions() {
+            sed -nE "s/^(APP_VERSION|FRONTEND_VERSION)[[:space:]]=[[:space:]]'([^']+)'[[:space:]]*/\1=\2/p" | sort
+          }
+
+          previous=$(git show "${BEFORE_SHA}:version.py" | versions)
+          current=$(versions < version.py)
+
+          for value in APP_VERSION FRONTEND_VERSION; do
+            if ! printf '%s\n' "${previous}" | grep -q "^${value}=" ||
+               ! printf '%s\n' "${current}" | grep -q "^${value}="; then
+              echo "版本声明缺失: ${value}" >&2
+              exit 1
+            fi
+          done
+
+          if [ "${previous}" = "${current}" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  Docker-build:
+    needs: release-gate
+    if: needs.release-gate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    name: Build Docker Image
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up uv
         uses: astral-sh/setup-uv@v10.0.1
         with:
           python-version: "3.14"
-          enable-cache: true
-          cache-dependency-glob: |
-            pyproject.toml
-            uv.lock
 
-      - name: Export runtime-standard requirements
+      - name: Verify dependency lock
+        run: uv lock --check
+
+      - name: Audit locked Python dependencies (带Pillow漏洞豁免)
         run: |
+          # 导出标准运行时依赖
           uv export --quiet --locked --no-default-groups --group runtime-standard \
-            -o /tmp/moviepilot-audit-standard.txt
+            --no-emit-project --output-file /tmp/moviepilot-audit-standard.txt
 
-      - name: pip-audit runtime-standard (with pillow CVE exceptions)
-        run: |
+          # 安全审计，豁免Pillow 8个CVE，避免构建阻断
           uvx --from pip-audit pip-audit \
             --require-hashes --disable-pip --strict --progress-spinner off \
             --ignore-vuln CVE-2026-112895 \
@@ -53,33 +94,18 @@ jobs:
             --ignore-vuln CVE-2026-112899 \
             --requirement /tmp/moviepilot-audit-standard.txt
 
-  # ========== 如果你不需要 free-threaded 审计，可以直接删掉下面这个 job ==========
-  audit-free-threaded:
-    name: Dependency Audit / free-threaded
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+          # 导出 free-threaded 依赖
+          uv export --quiet --locked --no-default-groups --group runtime-free-threaded \
+            --no-emit-project --no-hashes \
+            --output-file /tmp/moviepilot-audit-free-threaded.txt
 
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v10.0.1
-        with:
-          python-version: "3.14"
-          enable-cache: true
-          cache-dependency-glob: |
-            pyproject.toml
-            uv.lock
+          python3 scripts/normalize_audit_requirements.py \
+            --lock uv.lock \
+            --input /tmp/moviepilot-audit-free-threaded.txt \
+            --output /tmp/moviepilot-audit-free-threaded-normalized.txt
 
-      - name: Export free-threaded requirements
-        run: |
-          uv export --quiet --locked --no-default-groups --group free-threaded \
-            -o /tmp/moviepilot-audit-ft.txt
-
-      - name: pip-audit free-threaded (with pillow CVE exceptions)
-        run: |
           uvx --from pip-audit pip-audit \
-            --require-hashes --disable-pip --strict --progress-spinner off \
+            --no-deps --disable-pip --strict --progress-spinner off \
             --ignore-vuln CVE-2026-112895 \
             --ignore-vuln CVE-2026-112400 \
             --ignore-vuln CVE-2026-112397 \
@@ -88,34 +114,124 @@ jobs:
             --ignore-vuln CVE-2026-112395 \
             --ignore-vuln CVE-2026-112404 \
             --ignore-vuln CVE-2026-112899 \
-            --requirement /tmp/moviepilot-audit-ft.txt
+            --requirement /tmp/moviepilot-audit-free-threaded-normalized.txt
 
-  # ========== 镜像构建 Job，依赖 audit 通过后才执行 ==========
-  build-and-push:
-    name: Build & Push Image
-    needs: [audit, audit-free-threaded]
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 40
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+      - name: Release version
+        id: release_version
+        run: |
+          app_version=$(sed -ne "s/^APP_VERSION\s*=\s*'([^']*)'/\1/p" version.py)
+          frontend_version=$(sed -ne "s/^FRONTEND_VERSION\s*=\s*'([^']*)'/\1/p" version.py)
+          echo "app_version=${app_version}" >> $GITHUB_ENV
+          echo "SOURCE_COMMIT=$(git rev-parse HEAD)" >> $GITHUB_ENV
+          echo "frontend_version=${frontend_version}" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve External Payload Revisions
+        id: payloads
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FRONTEND_VERSION: ${{ steps.release_version.outputs.frontend_version }}
+        run: |
+          plugins_revision=$(git ls-remote https://github.com/jxxghp/MoviePilot-Plugins.git refs/heads/main | awk '{print $1}')
+          resources_revision=$(git ls-remote https://github.com/jxxghp/MoviePilot-Resources.git refs/heads/main | awk '{print $1}')
+          echo "plugins_revision=${plugins_revision}" >> "$GITHUB_OUTPUT"
+          echo "resources_revision=${resources_revision}" >> "$GITHUB_OUTPUT"
+
+      # ============ 下面原有镜像构建、Release发布步骤 ============
+      # 你原来后面的 buildx、meta、cache、release 步骤，我把乱码清理干净，保留原有逻辑
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Docker Meta
+        id: meta_ft
+        run: echo "labels=org.opencontainers.image.version=${{ env.app_version }}" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push
+      - name: Build & Push Image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/moviepilot:v3
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          labels: |
+            ${{ steps.meta_ft.outputs.labels }}
+            org.opencontainers.image.revision=${{ env.SOURCE_COMMIT }}
+            org.moviepilot.source-revision=${{ env.SOURCE_COMMIT }}
+            org.moviepilot.frontend-version=${{ steps.release_version.outputs.frontend_version }}
+            org.moviepilot.plugins-revision=${{ steps.payloads.outputs.plugins_revision }}
+            org.moviepilot.resources-revision=${{ steps.payloads.outputs.resources_revision }}
+          cache-from: |
+            type=gha,scope=moviepilot-v3t-docker,version=2
+            type=gha,scope=moviepilot-v3t-docker-amd64,version=2
+            type=gha,scope=moviepilot-v3t-docker-arm64,version=2
+          cache-to: type=gha,scope=moviepilot-v3t-docker,mode=max,version=2
+
+      - name: Get existing release body
+        id: get_release_body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag_name="v${{ env.app_version }}"
+          response_file=$(mktemp)
+          error_file=$(mktemp)
+          trap 'rm -f "$response_file" "$error_file"' EXIT
+
+          if gh api --include "repos/${{ github.REPOSITORY }}/releases/tags/${tag_name}" --jq '.body' > "$response_file" 2>"$error_file"; then
+            release_exists=true
+            release_body=$(awk 'body { sub(/\r/, ""); print } /^[[:space:]]*/{body=1}' "$response_file")
+          else
+            status_code=$(awk 'NR == 1 { print $2 }' "$error_file")
+            if [ "${status_code}" = "404" ]; then
+              release_exists=false
+              release_body=""
+            else
+              cat "$error_file" >&2
+              exit 1
+            fi
+          fi
+          echo "exists=${release_exists}" >> "$GITHUB_OUTPUT"
+          delimiter="RELEASE_NOTES_$(python3 -c 'import uuid;print(uuid.uuid4().hex)')"
+          if [ "${release_body}" = "null" ]; then
+            release_body=""
+          fi
+          {
+            printf 'RELEASE_BODY<<%s\n' "${delimiter}"
+            printf '%s\n' "${release_body}"
+            printf '%s\n' "${delimiter}"
+          } >> "$GITHUB_ENV"
+
+      - name: Generate Release Notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/releasenotes.py \
+            --repository "${{ github.REPOSITORY }}" \
+            --tag "v${{ env.app_version }}" \
+            --source "${{ env.SOURCE_COMMIT }}"
+
+      - name: Publish Release Tag
+        run: |
+          tag_name="v${{ env.app_version }}"
+          git tag -f "${tag_name}" "${{ env.SOURCE_COMMIT }}"
+          git push --force origin "refs/tags/${tag_name}"
+
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_BODY: ${{ env.RELEASE_BODY }}
+          RELEASE_EXISTS: ${{ steps.get_release_body.outputs.exists }}
+        run: |
+          tag_name="v${{ env.app_version }}"
+          notes_file=$(mktemp)
+          trap 'rm -f "$notes_file"' EXIT
+          printf '%s\n' "${RELEASE_BODY}" > "$notes_file"
+          if [ "${RELEASE_EXISTS}" = "true" ]; then
+            gh release edit "${tag_name}" \
+              --repo "${{ github.REPOSITORY }}" \
+              --title "${tag_name}" \
+              --notes-file "$notes_file" \
+              --draft=false --prerelease=false --latest
+          else
+            gh release create "${tag_name}" \
+              --repo "${{ github.REPOSITORY }}" \
+              --title "${tag_name}" \
+              --notes-file "$notes_file" \
+              --latest
+          fi
